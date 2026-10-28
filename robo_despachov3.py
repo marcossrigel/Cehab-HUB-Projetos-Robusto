@@ -1,37 +1,22 @@
 import os
-
 import gspread
-
 import re
-
 import time
-
 import sys
-
 import unicodedata
 
 from urllib.parse import urlparse, parse_qs
-
 from num2words import num2words
-
 from dotenv import load_dotenv
-
 from selenium.common.exceptions import UnexpectedAlertPresentException
-
 from selenium.webdriver.common.alert import Alert
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys
-
 from seleniumbase import Driver
-
 from selenium.webdriver.support.ui import WebDriverWait
-
 from selenium.webdriver.support import expected_conditions as EC
-
 from oauth2client.service_account import ServiceAccountCredentials
-
 from selenium.webdriver.common.by import By
-
 from datetime import datetime
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
@@ -40,63 +25,39 @@ from html import escape as escapar_html
 ABA = "BMs 2026"
 
 if getattr(sys, "frozen", False):
-
     BASE_DIR = os.path.dirname(sys.executable)
 
 else:
-
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CREDENCIAIS_GOOGLE = os.path.join(
-
     BASE_DIR,
-
     "arquivos_json",
-
     "credenciais_sheets.json"
-
 )
 
 ENV_PATH = os.path.join(
-
     BASE_DIR,
-
     "arquivos_json",
-
-    "arquivo.env"
-
+    "arquivo.env" 
 )
 
 def conectar_planilha():
-
     load_dotenv(ENV_PATH)
-
     planilha_id = os.getenv("PLANILHA_ID")
 
     if not planilha_id:
-
         raise ValueError(f"PLANILHA_ID não encontrado em {ENV_PATH}")
-
     scope = [
-
         "https://spreadsheets.google.com/feeds",
-
         "https://www.googleapis.com/auth/drive"
-
     ]
-
     creds = ServiceAccountCredentials.from_json_keyfile_name(
-
         CREDENCIAIS_GOOGLE, scope
-
     )
-
     client = gspread.authorize(creds)
-
     planilha = client.open_by_key(planilha_id)
-
     return planilha.worksheet(ABA)
-
 
 def atualizar_planilha_enviado(linhas_planilha):
     linhas = sorted(set(int(n) for n in linhas_planilha))
@@ -122,187 +83,100 @@ def atualizar_planilha_enviado(linhas_planilha):
 
 
 def obter_aguardando_sei():
-
     worksheet = conectar_planilha()
-
     registros = worksheet.get_all_records()
-
     lista = []
 
     for idx, linha in enumerate(
-
         registros,
-
         start=2
-
     ):
 
         status = str(
-
             linha.get(
-
                 "STATUS",
-
                 ""
-
             )
-
         ).strip().upper()
 
         if status == "AGUARDANDO SEI":
-
             lista.append({
-
                 "linha_planilha": idx,
-
                 "numero_sei":
-
                 linha.get(
-
                     "N° do SEI",
-
                     ""
-
                 ),
-
                 "fonte":
-
                 linha.get(
-
                     "FONTE",
-
                     ""
-
                 ),
-
                 "fonte_recurso":
-
                 linha.get(
-
                     "Fonte de Recursos",
-
                     ""
-
                 ),
-
                 "ficha_financeira":
-
                 linha.get(
-
                     "Ficha Financeira",
-
                     ""
-
                 ),
-
                 "resolucao":
-
                 linha.get(
-
                     "RESOLUÇÃO",
-
                     ""
-
                 ),
-
                 "responsavel":
-
                 linha.get(
-
                     "RESPONSÁVEL",
-
                     ""
-
                 ),
-
                 "linha_completa":
-
                 worksheet.row_values(idx)
-
             })
-
     return lista
 
 def iniciar_robo():
-
     load_dotenv(ENV_PATH)
-
     usuario = os.getenv(
-
         "SEI_USER"
-
     )
-
     senha = os.getenv(
-
         "SEI_PASS"
-
     )
-
     browser = Driver(
-
         uc=False,
-
         headless=True,
-
         log_cdp=False
-
     )
-
     browser.get(
-
         "https://sei.pe.gov.br/sip/login.php?sigla_orgao_sistema=GOVPE&sigla_sistema=SEI"
-
     )
-
     browser.sleep(3)
-
     browser.find_element(
-
         "css selector",
-
         "#selOrgao"
-
     ).send_keys(
-
         "CEHAB"
-
     )
-
     browser.find_element(
-
         "xpath",
-
         '//*[@id="txtUsuario"]'
-
     ).send_keys(
-
         usuario
-
     )
-
     browser.find_element(
-
         "xpath",
-
         '//*[@id="pwdSenha"]'
-
     ).send_keys(
-
         senha
-
     )
-
     browser.find_element(
-
         "xpath",
-
         '//*[@id="sbmAcessar"]'
-
     ).click()
-
     browser.sleep(5)
-
     return browser
 
 def verificar_recebidos(browser, numero_sei):
@@ -1581,16 +1455,19 @@ def montar_html_consolidado(html_original, linhas, solicitacao_numero, id_docume
     
     # Regra especial para a fonte FINISA 0754006019
     bloco_financeiro = "\n".join(novos_paragrafos)
-
     fonte_finisa = "0754006019"
+    tem_finisa = False
 
-    tem_finisa = any(
-        fonte_finisa in re.sub(
-            r"\D", "",
-            str(dados.get("fonte", ""))
-        )
-        for dados in linhas
-    )
+    for dados in linhas:
+        fonte_original = str(dados.get("fonte", "") or "").strip()
+        fonte_normalizada = re.sub(r"\D", "", fonte_original).zfill(10)
+
+        print(f"FONTE ORIGINAL: {fonte_original!r}")
+        print(f"FONTE NORMALIZADA: {fonte_normalizada}")
+
+        if fonte_normalizada == "0754006019":
+            tem_finisa = True
+            print("FONTE FINISA IDENTIFICADA!")
 
     if tem_finisa:
         observacao = (
