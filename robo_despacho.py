@@ -31,7 +31,7 @@ MODO_VISUAL_DESPACHO = True
 PAUSA_ENTRE_ACOES = 1.5
 
 # Somente este processo poderá ser processado no teste.
-SEI_ALVO = "0060900175.001097/2026-92"
+SEI_ALVO = "00609110022711.000940/2026-30"
 
 def conectar_planilha():
     load_dotenv(ENV_PATH)
@@ -3109,7 +3109,7 @@ def apagar_conteudo_e_salvar(browser, gop, mensagem, numero_solicitacao, link):
     return True
 
 
-def montar_mensagem_gop(dados, numero_solicitacao):
+def montar_mensagem_gop(dados, numero_solicitacao, numero_gop):
     """
     Monta a mensagem completa a partir da planilha.
     Não interage com o navegador.
@@ -3122,7 +3122,13 @@ def montar_mensagem_gop(dados, numero_solicitacao):
 
     processo = str(dados["numero_sei"]).strip()
     solicitacao = str(numero_solicitacao).strip()
+    numero_gop = str(numero_gop).strip()
     bm = str(colunas[13]).strip()
+
+    if not re.fullmatch(r"\d{8}", numero_gop):
+        raise RuntimeError(
+            "Número do GOP criado não identificado corretamente."
+        )
 
     valor_original = str(colunas[14]).strip()
     valor_limpo = (
@@ -3168,8 +3174,8 @@ def montar_mensagem_gop(dados, numero_solicitacao):
     mensagem = (
         "DISPONIBILIDADE FINANCEIRA - GOP\n\n"
         "CEHAB - DISPONIBILIDADE FINANCEIRA - GOP\n\n"
-        "Processo nº\n\n"
-        "Despacho:\n\n"
+        f"Processo nº: {processo}\n\n"
+        f"Despacho: {numero_gop}\n\n"
         "Destinatário: GAC\n\n"
         f"Em atendimento ao despacho {solicitacao}, "
         "informo que há disponibilidade orçamentária "
@@ -3177,6 +3183,7 @@ def montar_mensagem_gop(dados, numero_solicitacao):
         f"BM {bm}, no valor de R$ {valor}, "
         f"na Fonte de Recursos {fonte} "
         "(Tipo da Fonte Ex.: Tesouro do Estado).\n\n"
+        "À GEFIN,\n\n"
     )
         
     print("[MENSAGEM] Processo:", processo)
@@ -3674,7 +3681,12 @@ def executar_teste():
         executar_discreto(selecionar_gop_recem_criado, browser, gop["id_interno"], gop["numero_sei"])
         executar_discreto(clicar_editar_conteudo, browser, gop["id_interno"])
         print("Editor de conteúdo aberto")
-        mensagem = executar_discreto(montar_mensagem_gop, linhas[0], solicitacao["numero"])
+        mensagem = executar_discreto(
+            montar_mensagem_gop,
+            linhas[0],
+            solicitacao["numero"],
+            gop["numero_sei"]
+        )
         print("Inserindo mensagem financeira da planilha...")
         executar_discreto(
             apagar_conteudo_e_salvar,
