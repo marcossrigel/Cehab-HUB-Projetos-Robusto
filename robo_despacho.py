@@ -31,7 +31,7 @@ MODO_VISUAL_DESPACHO = True
 PAUSA_ENTRE_ACOES = 1.5
 
 # Somente este processo poderá ser processado no teste.
-SEI_ALVO = "00609110022711.000940/2026-30"
+SEI_ALVO = "0060900175.001097/2026-92"
 
 def conectar_planilha():
     load_dotenv(ENV_PATH)
@@ -49,6 +49,100 @@ def conectar_planilha():
     client = gspread.authorize(creds)
     planilha = client.open_by_key(planilha_id)
     return planilha.worksheet(ABA)
+
+
+
+def atualizar_status_apos_gop(dados, numero_gop):
+    """
+    Atualiza somente a célula STATUS da linha processada.
+
+    Executar exclusivamente depois de confirmar
+    o salvamento do GOP e fechar o editor.
+    """
+
+    worksheet = conectar_planilha()
+
+    linha = int(dados["linha_planilha"])
+    sei_esperado = str(dados["numero_sei"]).strip()
+
+    # Identificar as colunas pelos cabeçalhos.
+    cabecalhos = [
+        str(valor).strip()
+        for valor in worksheet.row_values(1)
+    ]
+
+    if cabecalhos.count("STATUS") != 1:
+        raise RuntimeError(
+            "Coluna STATUS não identificada de forma única."
+        )
+
+    if cabecalhos.count("N° do SEI") != 1:
+        raise RuntimeError(
+            "Coluna N° do SEI não identificada de forma única."
+        )
+
+    coluna_status = cabecalhos.index("STATUS") + 1
+    coluna_sei = cabecalhos.index("N° do SEI") + 1
+
+    # Confirma que STATUS continua sendo a coluna Z.
+    if coluna_status != 26:
+        raise RuntimeError(
+            "A coluna STATUS mudou de posição. "
+            "Atualização interrompida."
+        )
+
+    # Relê a linha diretamente do Google Sheets.
+    valores = worksheet.row_values(linha)
+
+    def valor_coluna(indice):
+        if len(valores) >= indice:
+            return str(valores[indice - 1]).strip()
+        return ""
+
+    sei_atual = valor_coluna(coluna_sei)
+    status_atual = valor_coluna(coluna_status).upper()
+
+    if sei_atual != sei_esperado:
+        raise RuntimeError(
+            f"Linha {linha} não corresponde ao SEI esperado. "
+            "Nenhuma alteração foi realizada."
+        )
+
+    # Nunca sobrescrever outro status.
+    if status_atual != "AGUARDANDO SEI":
+        raise RuntimeError(
+            f"Status inesperado na linha {linha}: "
+            f"{status_atual!r}. Nenhuma alteração realizada."
+        )
+
+    # Altera exclusivamente a célula STATUS.
+    celula = f"Z{linha}"
+
+    worksheet.update_acell(
+        celula,
+        "AGUARDANDO ASSINATURA"
+    )
+
+    # Confirma a gravação.
+    status_confirmado = (
+        worksheet.acell(celula).value or ""
+    ).strip().upper()
+
+    if status_confirmado != "AGUARDANDO ASSINATURA":
+        raise RuntimeError(
+            "O Google Sheets não confirmou "
+            "a atualização do status."
+        )
+
+    print(
+        f"Planilha atualizada: linha {linha} | "
+        "AGUARDANDO ASSINATURA"
+    )
+
+    print(f"GOP vinculado ao processo: {numero_gop}")
+
+    return True
+
 
 def obter_aguardando_sei():
     worksheet = conectar_planilha()
@@ -3610,6 +3704,21 @@ def executar_teste():
         browser.switch_to.default_content()
 
         print("Editor fechado. Processo SEI permanece aberto.")
+
+        # =====================================================
+        # ATUALIZAR STATUS NA PLANILHA
+        # Executar somente após salvar e fechar o GOP.
+        # =====================================================
+
+        print("Atualizando status na planilha de BMs...")
+
+        executar_discreto(
+            atualizar_status_apos_gop,
+            linhas[0],
+            gop["numero_sei"]
+        )
+
+        print("Processamento finalizado com sucesso.")
 
     except Exception as erro:
         print(f"Erro: {erro}")
