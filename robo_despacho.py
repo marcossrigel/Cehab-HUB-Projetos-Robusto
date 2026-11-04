@@ -56,6 +56,114 @@ def conectar_planilha():
     return planilha.worksheet(ABA)
 
 
+def atualizar_status_apos_gop(linhas, numero_gop):
+    """
+    Atualiza todas as linhas vinculadas ao GOP,
+    somente depois de salvar e fechar o editor.
+    """
+    if not linhas:
+        raise RuntimeError("Nenhuma linha para atualizar.")
+
+    if not re.fullmatch(r"\d{8}", str(numero_gop)):
+        raise RuntimeError("Número do GOP inválido.")
+
+    worksheet = conectar_planilha()
+
+    cabecalhos = [
+        str(v).strip()
+        for v in worksheet.row_values(1)
+    ]
+
+    for nome in ("N° do SEI", "STATUS"):
+        if cabecalhos.count(nome) != 1:
+            raise RuntimeError(
+                f"Cabeçalho {nome} ausente ou duplicado."
+            )
+
+    col_sei = cabecalhos.index("N° do SEI")
+    col_status = cabecalhos.index("STATUS")
+
+    if col_status != 25:
+        raise RuntimeError(
+            "STATUS não está mais na coluna Z."
+        )
+
+    numeros = [
+        int(d["linha_planilha"])
+        for d in linhas
+    ]
+
+    if len(numeros) != len(set(numeros)):
+        raise RuntimeError("Linhas duplicadas no lote.")
+
+    processo_esperado = str(
+        linhas[0]["numero_sei"]
+    ).strip()
+
+    # Validar todas as linhas antes de atualizar.
+    for dados in linhas:
+        linha = int(dados["linha_planilha"])
+
+        if str(dados["numero_sei"]).strip() != processo_esperado:
+            raise RuntimeError(
+                "Lote contém processos SEI diferentes."
+            )
+
+        valores = worksheet.row_values(linha)
+
+        sei_atual = (
+            valores[col_sei].strip()
+            if col_sei < len(valores) else ""
+        )
+
+        status_atual = (
+            valores[col_status].strip().upper()
+            if col_status < len(valores) else ""
+        )
+
+        if (
+            sei_atual != processo_esperado
+            or status_atual != "AGUARDANDO SEI"
+        ):
+            raise RuntimeError(
+                f"Linha {linha} mudou na planilha. "
+                "Nenhum status atualizado."
+            )
+
+    # Atualiza as três células em uma requisição.
+    worksheet.batch_update(
+        [
+            {
+                "range": f"Z{linha}",
+                "values": [["AGUARDANDO ASSINATURA"]]
+            }
+            for linha in numeros
+        ],
+        value_input_option="RAW"
+    )
+
+    # Confirmar cada atualização.
+    for linha in numeros:
+        status = (
+            worksheet.acell(f"Z{linha}").value or ""
+        ).strip().upper()
+
+        if status != "AGUARDANDO ASSINATURA":
+            raise RuntimeError(
+                f"Status não confirmado na linha {linha}. "
+                "O GOP já foi salvo; não repetir criação."
+            )
+
+    print(
+        f"Planilha atualizada: {len(numeros)} linhas "
+        "em AGUARDANDO ASSINATURA."
+    )
+    print(f"GOP: {numero_gop}")
+
+    return True
+
+
+
 
 def atualizar_status_apos_gop(dados, numero_gop):
     """
@@ -3730,13 +3838,139 @@ def pesquisar_proximo_sei(browser, numero_sei):
     validar_processo_atual(browser, numero_sei)
 
 
+def consolidar_linhas_mesmo_sei(linhas):
+    """
+    Consolida várias linhas do mesmo SEI em um único GOP.
+    Soma os valores da coluna O e reúne as RESOLUÇÕES.
+    """
+    if not linhas:
+        raise RuntimeError("Nenhuma linha para consolidar.")
+
+    ordenadas = sorted(
+        linhas,
+        key=lambda d: int(d["linha_planilha"])
+    )
+
+    processos = {
+        str(d["numero_sei"]).strip()
+        for d in ordenadas
+    }
+
+    if len(processos) != 1:
+        raise RuntimeError(
+            "Linhas pertencem a processos SEI diferentes."
+        )
+
+    # O modelo atual admite um BM, uma fonte,
+    # uma ficha financeira e um responsável.
+    for campo in ("fonte", "ficha_financeira", "responsavel"):
+        valores = {
+            normalizar_texto(d.get(campo, ""))
+            for d in ordenadas
+        }
+
+        if len(valores) != 1 or not next(iter(valores)):
+            raise RuntimeError(
+                f"Linhas com {campo} diferentes ou vazios. "
+                "Revisão necessária."
+            )
+
+    bms = set()
+    total = Decimal("0.00")
+    resolucoes = []
+
+    for dados in ordenadas:
+        linha = int(dados["linha_planilha"])
+        colunas = dados.get("linha_completa") or []
+
+        if len(colunas) < 15:
+            raise RuntimeError(
+                f"Linha {linha}: BM ou valor ausente."
+            )
+
+        bm = normalizar_bm(colunas[13])
+
+        if not bm:
+            raise RuntimeError(f"Linha {linha}: BM inválido.")
+
+        bms.add(bm)
+
+        valor = str(colunas[14]).replace("R$", "").strip()
+        valor = (
+            re.sub(r"\s+", "", valor)
+            .replace(".", "")
+            .replace(",", ".")
+        )
+
+        try:
+            quantia = Decimal(valor).quantize(
+                Decimal("0.01")
+            )
+        except (InvalidOperation, ValueError):
+            raise RuntimeError(
+                f"Linha {linha}: valor inválido."
+            )
+
+        if quantia <= 0:
+            raise RuntimeError(
+                f"Linha {linha}: valor não positivo."
+            )
+
+        total += quantia
+
+        resolucao = str(
+            dados.get("resolucao") or ""
+        ).strip()
+
+        if not resolucao:
+            raise RuntimeError(
+                f"Linha {linha}: RESOLUÇÃO vazia."
+            )
+
+        resolucoes.append(resolucao)
+
+    if len(bms) != 1:
+        raise RuntimeError(
+            "As linhas possuem BMs diferentes. "
+            "Revisar antes de gerar um GOP único."
+        )
+
+    # Cria um registro consolidado sem alterar
+    # as linhas originais da planilha.
+    dados_consolidados = dict(ordenadas[0])
+    dados_consolidados["linha_completa"] = list(
+        ordenadas[0]["linha_completa"]
+    )
+
+    valor_formatado = (
+        f"{total:,.2f}"
+        .replace(",", "#")
+        .replace(".", ",")
+        .replace("#", ".")
+    )
+
+    dados_consolidados["linha_completa"][14] = valor_formatado
+
+    dados_consolidados["resolucao"] = "\n".join(
+        resolucoes
+    )
+
+    print(
+        f"[CONSOLIDADO] {len(ordenadas)} linhas | "
+        f"Total: R$ {valor_formatado}"
+    )
+
+    for resolucao in resolucoes:
+        print(f"[RESOLUÇÃO] {resolucao}")
+
+    return dados_consolidados
+
+
+
 def processar_sei_da_fila(browser, numero_sei, linhas):
     """Reaproveita as etapas já validadas; não desconecta o Chrome."""
-    if len(linhas) != 1:
-        raise RuntimeError(
-            "Processo com várias linhas AGUARDANDO SEI. "
-            "Precisa associar cada BM antes de automatizar."
-        )
+    if not linhas:
+        raise RuntimeError("Processo sem linhas pendentes.")
 
     print("=" * 72)
     print(f"Verificando: {numero_sei}")
@@ -3747,6 +3981,20 @@ def processar_sei_da_fila(browser, numero_sei, linhas):
     lotes = executar_discreto(preparar_lotes, linhas, solicitacoes, browser)
     if len(lotes) != 1:
         raise RuntimeError("Solicitação ambígua ou incompatível com o BM.")
+
+    if {
+        d["linha_planilha"] for d in lotes[0]["linhas"]
+    } != {
+        d["linha_planilha"] for d in linhas
+    }:
+        raise RuntimeError(
+            "Nem todas as linhas foram associadas à solicitação."
+        )
+
+    dados_consolidados = executar_discreto(
+        consolidar_linhas_mesmo_sei,
+        lotes[0]["linhas"]
+    )
 
     solicitacao = lotes[0]["solicitacao"]
     print(f"Encontrou solicitação de disponibilidade: {solicitacao['texto']}")
@@ -3770,18 +4018,24 @@ def processar_sei_da_fila(browser, numero_sei, linhas):
 
     if not executar_discreto(conferir_responsavel, linhas):
         raise RuntimeError("Responsável não confirmado.")
-    executar_discreto(conferir_pendente_antes_de_criar, linhas[0])
+    for registro in linhas:
+        executar_discreto(
+            conferir_pendente_antes_de_criar,
+            registro
+        )
 
     # Valide os dados ANTES da criação: o GOP ainda não existe, portanto
     # usamos um número fictício válido apenas para validar a mensagem.
     executar_discreto(
-        montar_mensagem_gop, linhas[0], solicitacao["numero"], "12345678"
+        montar_mensagem_gop, dados_consolidados, solicitacao["numero"], "12345678"
     )
     print("Gerando documento CEHAB - DISPONIBILIDADE FINANCEIRA - GOP...")
     executar_discreto(mostrar_criacao, browser, numero_sei, solicitacao["numero"])
 
     # A partir deste ponto não repetir automaticamente em caso de erro.
-    numero = executar_discreto(criar_documento, browser, linhas[0], solicitacao)
+    numero = executar_discreto(
+        criar_documento, browser, dados_consolidados, solicitacao
+    )
     if numero != solicitacao["numero"]:
         raise RuntimeError("Criação incerta: confira o SEI antes de repetir.")
     print("Documento solicitado.")
@@ -3797,7 +4051,7 @@ def processar_sei_da_fila(browser, numero_sei, linhas):
     print("Editor de conteúdo aberto")
 
     mensagem = executar_discreto(
-        montar_mensagem_gop, linhas[0], solicitacao["numero"], gop["numero_sei"]
+        montar_mensagem_gop, dados_consolidados, solicitacao["numero"], gop["numero_sei"]
     )
     print("Inserindo mensagem financeira da planilha...")
     executar_discreto(
@@ -3819,7 +4073,11 @@ def processar_sei_da_fila(browser, numero_sei, linhas):
     print("Editor fechado. Processo SEI permanece aberto.")
 
     print("Atualizando status na planilha de BMs...")
-    executar_discreto(atualizar_status_apos_gop, linhas[0], gop["numero_sei"])
+    executar_discreto(
+        atualizar_status_apos_gop,
+        linhas,
+        gop["numero_sei"]
+    )
     print("Processamento finalizado com sucesso.")
     return "CONCLUIDO"
 
