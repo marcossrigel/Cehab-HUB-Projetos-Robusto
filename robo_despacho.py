@@ -2448,8 +2448,189 @@ def diagnosticar_editor(browser, gop):
     return resultado
 
 
+def inserir_link_solicitacao(browser, numero, link):
+    """
+    Seleciona o número da solicitação no editor,
+    abre Ctrl+K e insere o acesso direto do SEI.
+    """
 
-def apagar_conteudo_e_salvar(browser, gop, mensagem):
+    numero = str(numero).strip()
+    link = str(link).strip()
+
+    if not re.fullmatch(r"\d{8}", numero):
+        raise RuntimeError("Número da solicitação inválido.")
+
+    url = urlparse(link)
+
+    if url.scheme != "https" or url.hostname != "sei.pe.gov.br":
+        raise RuntimeError("Link não pertence ao SEI.")
+
+    editor = WebDriverWait(browser, 20).until(
+        EC.visibility_of_element_located((
+            By.CSS_SELECTOR,
+            '[id^="txaEditor_"][contenteditable="true"]'
+        ))
+    )
+
+    # Seleciona exatamente os oito dígitos dentro do texto.
+    selecionado = browser.execute_script("""
+        const editor = arguments[0];
+        const numero = arguments[1];
+        const encontrados = [];
+        const walker = document.createTreeWalker(
+            editor, NodeFilter.SHOW_TEXT
+        );
+
+        let node;
+
+        while ((node = walker.nextNode())) {
+            const texto = node.textContent || "";
+            let inicio = texto.indexOf(numero);
+
+            while (inicio !== -1) {
+                const antes = texto[inicio - 1] || "";
+                const depois = texto[inicio + numero.length] || "";
+
+                if (!/[0-9]/.test(antes) &&
+                    !/[0-9]/.test(depois)) {
+                    encontrados.push({
+                        node: node,
+                        inicio: inicio
+                    });
+                }
+
+                inicio = texto.indexOf(
+                    numero, inicio + numero.length
+                );
+            }
+        }
+
+        if (encontrados.length !== 1) {
+            return encontrados.length;
+        }
+
+        const alvo = encontrados[0];
+        const range = document.createRange();
+
+        range.setStart(alvo.node, alvo.inicio);
+        range.setEnd(
+            alvo.node, alvo.inicio + numero.length
+        );
+
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+
+        document.dispatchEvent(new Event("selectionchange"));
+
+        return selection.toString() === numero ? 1 : 0;
+    """, editor, numero)
+
+    if selecionado != 1:
+        raise RuntimeError(
+            "Não foi possível selecionar exclusivamente "
+            f"a solicitação {numero}. Ocorrências: {selecionado}"
+        )
+
+    print(f"Solicitação selecionada: {numero}")
+
+    # Abre a ferramenta Link do CKEditor.
+    from selenium.webdriver.common.action_chains import ActionChains
+
+    ActionChains(browser).key_down(
+        Keys.CONTROL
+    ).send_keys(
+        "k"
+    ).key_up(
+        Keys.CONTROL
+    ).perform()
+
+    print("Comando Ctrl+K executado.")
+
+    # Localiza a caixa de link pela estrutura do CKEditor.
+    # Não depende daquele ID dinâmico do XPath da imagem.
+    painel = WebDriverWait(browser, 15).until(
+        EC.visibility_of_element_located((
+            By.CSS_SELECTOR,
+            ".ck-balloon-panel.ck-balloon-panel_visible"
+        ))
+    )
+
+    campos = [
+        campo for campo in painel.find_elements(
+            By.CSS_SELECTOR, "input:not([type='hidden'])"
+        )
+        if campo.is_displayed() and campo.is_enabled()
+    ]
+
+    
+    # O painel possui dois campos:
+    # 0 - Texto mostrado
+    # 1 - URL do link
+
+    if len(campos) != 2:
+        raise RuntimeError(
+            f"Estrutura inesperada do painel Link: "
+            f"{len(campos)} campos."
+        )
+
+    campo_texto = campos[0]
+    campo_url = campos[1]
+
+    # Confirma que não vamos alterar o texto mostrado.
+    texto_mostrado = (
+        campo_texto.get_attribute("value") or ""
+    ).strip()
+
+    if texto_mostrado != numero:
+        raise RuntimeError(
+            f"Texto mostrado inesperado: {texto_mostrado!r}"
+        )
+
+    # Preenche somente o campo URL do link.
+    campo_url.click()
+    campo_url.send_keys(Keys.CONTROL, "a")
+    campo_url.send_keys(link)
+
+    if (campo_url.get_attribute("value") or "").strip() != link:
+        raise RuntimeError(
+            "O endereço não foi preenchido corretamente."
+        )
+
+    print("URL de acesso direto preenchida.")
+
+    # Confirma o formulário com Enter.
+    campo_url.send_keys(Keys.ENTER)
+
+    print("Enter pressionado. Verificando hyperlink...")
+
+
+    # Confirma o hyperlink no conteúdo editável.
+    def conferir(driver):
+        editor_atual = driver.find_element(
+            By.CSS_SELECTOR,
+            '[id^="txaEditor_"][contenteditable="true"]'
+        )
+
+        links = editor_atual.find_elements(
+            By.TAG_NAME, "a"
+        )
+
+        correspondentes = [
+            a for a in links
+            if a.text.strip() == numero
+            and a.get_attribute("href") == link
+        ]
+
+        return len(correspondentes) == 1
+
+    WebDriverWait(browser, 15).until(conferir)
+
+    print("Hiperlink confirmado no editor.")
+    return True
+
+
+def apagar_conteudo_e_salvar(browser, gop, mensagem, numero_solicitacao, link):
     """
     Apaga o conteúdo antigo, escreve a mensagem completa
     pelo teclado, valida e salva no SEI.
@@ -2591,6 +2772,13 @@ def apagar_conteudo_e_salvar(browser, gop, mensagem):
 
     print("[EDITOR] Texto permaneceu após perder o foco.")
 
+    # Insere o acesso direto na referência à solicitação.
+    inserir_link_solicitacao(
+        browser,
+        numero_solicitacao,
+        link
+    )
+
     # 5. Procura o botão Salvar.
     botoes = browser.find_elements(
         By.XPATH,
@@ -2635,6 +2823,24 @@ def apagar_conteudo_e_salvar(browser, gop, mensagem):
         )
 
     print("[SALVAR] Conteúdo confirmado após recarregar.")
+    editor = browser.find_element(
+        By.CSS_SELECTOR,
+        '[id^="txaEditor_"][contenteditable="true"]'
+    )
+
+    links_salvos = [
+        a for a in editor.find_elements(By.TAG_NAME, "a")
+        if a.text.strip() == str(numero_solicitacao)
+        and a.get_attribute("href") == link
+    ]
+
+    if len(links_salvos) != 1:
+        raise RuntimeError(
+            "O texto foi salvo, mas o hyperlink "
+            "da solicitação não foi confirmado."
+        )
+
+    print("Link da solicitação confirmado após salvar.")
     print(f"[GOP] Documento: {gop['numero_sei']}")
     print("[TESTE CONCLUÍDO] Mensagem gravada no editor.")
     print("[PARADA] Não assina e não atualiza a planilha.")
@@ -3165,8 +3371,34 @@ def executar_teste():
         print("Editor de conteúdo aberto")
         mensagem = executar_discreto(montar_mensagem_gop, linhas[0], solicitacao["numero"])
         print("Inserindo mensagem financeira da planilha...")
-        executar_discreto(apagar_conteudo_e_salvar, browser, gop, mensagem)
+        executar_discreto(
+            apagar_conteudo_e_salvar,
+            browser,
+            gop,
+            mensagem,
+            solicitacao["numero"],
+            link
+        )
+
         print(f"GOP salvo: {gop['numero_sei']}")
+
+        # Fecha somente a janela correta do editor.
+        parametros = parse_qs(urlparse(browser.current_url).query)
+
+        if (
+            parametros.get("acao", [""])[0] != "editor_montar"
+            or parametros.get("id_documento", [""])[0]
+            != str(gop["id_interno"])
+        ):
+            raise RuntimeError(
+                "Janela do editor não corresponde ao GOP esperado."
+            )
+
+        browser.close()
+        browser.switch_to.window(principal)
+        browser.switch_to.default_content()
+
+        print("Editor fechado. Processo SEI permanece aberto.")
 
     except Exception as erro:
         print(f"Erro: {erro}")
