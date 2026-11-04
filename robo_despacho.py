@@ -31,7 +31,12 @@ MODO_VISUAL_DESPACHO = True
 PAUSA_ENTRE_ACOES = 1.5
 
 # Somente este processo poderá ser processado no teste.
-SEI_ALVO = "0060900175.001099/2026-81"
+# Fila alimentada pela planilha; não há processo fixo.
+APENAS_LISTAR_FILA = False
+INTERVALO_CONSULTA = 90
+LIMITE_POR_CICLO = 0
+BLOQUEAR_GOP_EXISTENTE = True
+PARAR_EM_ERRO = False      # Interrompe o lote para revisão se houver falha.
 
 def conectar_planilha():
     load_dotenv(ENV_PATH)
@@ -145,59 +150,43 @@ def atualizar_status_apos_gop(dados, numero_gop):
 
 
 def obter_aguardando_sei():
+    """Lê a aba uma única vez, preservando o texto dos códigos de FONTE."""
     worksheet = conectar_planilha()
-    registros = worksheet.get_all_records()
-    lista = []
+    linhas_planilha = worksheet.get_all_values()
+    if not linhas_planilha:
+        raise RuntimeError("Planilha de BMs vazia.")
 
-    for idx, linha in enumerate(
-        registros,
-        start=2
-    ):
+    cabecalhos = [str(v).strip() for v in linhas_planilha[0]]
+    obrigatorios = (
+        "STATUS", "N° do SEI", "FONTE", "Fonte de Recursos",
+        "Ficha Financeira", "RESOLUÇÃO", "RESPONSÁVEL"
+    )
+    for nome in obrigatorios:
+        if cabecalhos.count(nome) != 1:
+            raise RuntimeError(f"Coluna {nome!r} ausente ou duplicada.")
+    colunas = {nome: cabecalhos.index(nome) for nome in obrigatorios}
+    if colunas["STATUS"] != 25:
+        raise RuntimeError("A coluna STATUS não está em Z.")
 
-        status = str(
-            linha.get(
-                "STATUS",
-                ""
-            )
-        ).strip().upper()
+    registros = []
+    for indice, valores in enumerate(linhas_planilha[1:], start=2):
+        def campo(nome):
+            posicao = colunas[nome]
+            return str(valores[posicao]).strip() if posicao < len(valores) else ""
 
-        if status == "AGUARDANDO SEI":
-            lista.append({
-                "linha_planilha": idx,
-                "numero_sei":
-                linha.get(
-                    "N° do SEI",
-                    ""
-                ),
-                "fonte":
-                linha.get(
-                    "FONTE",
-                    ""
-               ),
-                "fonte_recurso":
-                linha.get(
-                    "Fonte de Recursos",
-                    ""
-                ),
-               "ficha_financeira":
-                linha.get(
-                    "Ficha Financeira",
-                    ""
-                ),
-                "resolucao":
-                linha.get(
-                    "RESOLUÇÃO",
-                    ""
-                ),
-                "responsavel":
-                linha.get(
-                    "RESPONSÁVEL",
-                    ""
-                ),
-                "linha_completa":
-                worksheet.row_values(idx)
-            })
-    return lista
+        if campo("STATUS").upper() != "AGUARDANDO SEI":
+            continue
+        registros.append({
+            "linha_planilha": indice,
+            "numero_sei": campo("N° do SEI"),
+            "fonte": campo("FONTE"),
+            "fonte_recurso": campo("Fonte de Recursos"),
+            "ficha_financeira": campo("Ficha Financeira"),
+            "resolucao": campo("RESOLUÇÃO"),
+            "responsavel": campo("RESPONSÁVEL"),
+            "linha_completa": valores,
+        })
+    return registros
 
 def mostrar_criacao(browser, processo, solicitacao):
     if not MODO_VISUAL_DESPACHO:
@@ -3259,10 +3248,11 @@ def montar_mensagem_gop(dados, numero_solicitacao, numero_gop):
             "Processo, solicitação, BM ou fonte não informados."
         )
 
-    if (processo != SEI_ALVO or not re.fullmatch(r"\d{8}", solicitacao)):
-        raise RuntimeError(
-            "Processo ou solicitação diferentes do teste."
-        )
+    if (
+        not re.fullmatch(r"\d{10,14}\.\d{6}/\d{4}-\d{2}", processo)
+        or not re.fullmatch(r"\d{8}", solicitacao)
+    ):
+        raise RuntimeError("Número do processo ou solicitação inválido.")
 
     mensagem = (
         "DISPONIBILIDADE FINANCEIRA - GOP\n\n"
@@ -3522,7 +3512,7 @@ def executar_discreto(funcao, *args, **kwargs):
             return funcao(*args, **kwargs)
 
 
-def validar_processo_atual(browser):
+def validar_processo_atual(browser, numero_sei):
     """Confirma o número do processo na árvore antes de qualquer operação."""
     browser.switch_to.default_content()
     WebDriverWait(browser, 25).until(
@@ -3532,7 +3522,7 @@ def validar_processo_atual(browser):
     try:
         WebDriverWait(browser, 25).until(
             lambda driver: any(
-                el.text.strip() == SEI_ALVO
+                el.text.strip() == numero_sei
                 for el in driver.find_elements(By.TAG_NAME, "a")
             )
         )
@@ -3676,174 +3666,236 @@ def localizar_gops_na_arvore(browser):
 
 
 
-def executar_teste():
+def conferir_pendente_antes_de_criar(dados):
+    """Reconfere linha e status para evitar processar uma edição recente."""
+    worksheet = conectar_planilha()
+    cabecalhos = [v.strip() for v in worksheet.row_values(1)]
+    col_sei = cabecalhos.index("N° do SEI")
+    col_status = cabecalhos.index("STATUS")
+    valores = worksheet.row_values(int(dados["linha_planilha"]))
+
+    def valor(indice):
+        return valores[indice].strip() if indice < len(valores) else ""
+
+    if valor(col_sei) != str(dados["numero_sei"]).strip():
+        raise RuntimeError("O processo da linha mudou na planilha.")
+    if valor(col_status).upper() != "AGUARDANDO SEI":
+        raise RuntimeError("O status mudou; criação cancelada.")
+
+
+def pesquisar_proximo_sei(browser, numero_sei):
+    """Volta à tela de controle, usa a lupa conhecida e valida a árvore."""
+    browser.switch_to.default_content()
+    acao = parse_qs(urlparse(browser.current_url).query).get("acao", [""])[0]
+
+    if acao == "procedimento_trabalhar":
+        links = browser.find_elements(
+            By.XPATH,
+            "//a[normalize-space(.)='Controle de Processos' "
+            "or .//*[normalize-space(.)='Controle de Processos']]"
+        )
+        links = [x for x in links if x.is_displayed() and x.is_enabled()]
+        if len(links) != 1:
+            raise RuntimeError(
+                "Menu Controle de Processos não localizado de forma única. "
+                "Verifique o HTML do menu antes de processar a fila."
+            )
+        browser.execute_script("arguments[0].click();", links[0])
+        WebDriverWait(browser, 30).until(
+            lambda d: parse_qs(urlparse(d.current_url).query)
+            .get("acao", [""])[0] == "procedimento_controlar"
+        )
+    elif acao != "procedimento_controlar":
+        raise RuntimeError("O Chrome não está em uma tela de processos do SEI.")
+
+    browser.switch_to.default_content()
+    campo = WebDriverWait(browser, 20).until(
+        EC.element_to_be_clickable((By.ID, "txtPesquisaRapida"))
+    )
+    campo.clear()
+    campo.send_keys(numero_sei)
+
+    lupa = WebDriverWait(browser, 20).until(
+        EC.element_to_be_clickable(
+            (By.XPATH, '//*[@id="spnInfraUnidade"]/img')
+        )
+    )
+    browser.execute_script("arguments[0].click();", lupa)
+
+    WebDriverWait(browser, 35).until(
+        lambda d: parse_qs(urlparse(d.current_url).query)
+        .get("acao", [""])[0] == "procedimento_trabalhar"
+        and len(d.find_elements(By.ID, "ifrArvore")) == 1
+    )
+    validar_processo_atual(browser, numero_sei)
+
+
+def processar_sei_da_fila(browser, numero_sei, linhas):
+    """Reaproveita as etapas já validadas; não desconecta o Chrome."""
+    if len(linhas) != 1:
+        raise RuntimeError(
+            "Processo com várias linhas AGUARDANDO SEI. "
+            "Precisa associar cada BM antes de automatizar."
+        )
+
+    print("=" * 72)
+    print(f"Verificando: {numero_sei}")
+    executar_discreto(verificar_sem_editor_pendente, browser)
+    executar_discreto(pesquisar_proximo_sei, browser, numero_sei)
+
+    solicitacoes = executar_discreto(listar_solicitacoes, browser)
+    lotes = executar_discreto(preparar_lotes, linhas, solicitacoes, browser)
+    if len(lotes) != 1:
+        raise RuntimeError("Solicitação ambígua ou incompatível com o BM.")
+
+    solicitacao = lotes[0]["solicitacao"]
+    print(f"Encontrou solicitação de disponibilidade: {solicitacao['texto']}")
+    print(f"Número: {solicitacao['numero']}")
+
+    principal = executar_discreto(janela_principal_sei, browser)
+    gops_antes = executar_discreto(localizar_gops_na_arvore, browser)
+    if BLOQUEAR_GOP_EXISTENTE and gops_antes:
+        print("REVISÃO: Já existe GOP neste SEI. Criação não realizada.")
+        return "REVISAR"
+
+    link = executar_discreto(capturar_link_solicitacao, browser, solicitacao)
+    if not link:
+        raise RuntimeError("Link de acesso direto não confirmado.")
+    executar_discreto(fechar_menu_solicitacao, browser, solicitacao)
+    print("Link Copiado")
+
+    if TESTE_SOMENTE_LEITURA:
+        print("Somente leitura: não criou nem editou GOP.")
+        return "LEITURA"
+
+    if not executar_discreto(conferir_responsavel, linhas):
+        raise RuntimeError("Responsável não confirmado.")
+    executar_discreto(conferir_pendente_antes_de_criar, linhas[0])
+
+    # Valide os dados ANTES da criação: o GOP ainda não existe, portanto
+    # usamos um número fictício válido apenas para validar a mensagem.
+    executar_discreto(
+        montar_mensagem_gop, linhas[0], solicitacao["numero"], "12345678"
+    )
+    print("Gerando documento CEHAB - DISPONIBILIDADE FINANCEIRA - GOP...")
+    executar_discreto(mostrar_criacao, browser, numero_sei, solicitacao["numero"])
+
+    # A partir deste ponto não repetir automaticamente em caso de erro.
+    numero = executar_discreto(criar_documento, browser, linhas[0], solicitacao)
+    if numero != solicitacao["numero"]:
+        raise RuntimeError("Criação incerta: confira o SEI antes de repetir.")
+    print("Documento solicitado.")
+
+    gop = executar_discreto(
+        obter_gop_pos_criacao, browser, principal, gops_antes, limite=30
+    )
+    executar_discreto(
+        selecionar_gop_recem_criado,
+        browser, gop["id_interno"], gop["numero_sei"]
+    )
+    executar_discreto(clicar_editar_conteudo, browser, gop["id_interno"])
+    print("Editor de conteúdo aberto")
+
+    mensagem = executar_discreto(
+        montar_mensagem_gop, linhas[0], solicitacao["numero"], gop["numero_sei"]
+    )
+    print("Inserindo mensagem financeira da planilha...")
+    executar_discreto(
+        apagar_conteudo_e_salvar,
+        browser, gop, mensagem, solicitacao["numero"], link
+    )
+    print(f"GOP salvo: {gop['numero_sei']}")
+
+    parametros = parse_qs(urlparse(browser.current_url).query)
+    if (
+        parametros.get("acao", [""])[0] != "editor_montar"
+        or parametros.get("id_documento", [""])[0] != str(gop["id_interno"])
+    ):
+        raise RuntimeError("A janela de edição não é a do GOP esperado.")
+
+    browser.close()
+    browser.switch_to.window(principal)
+    browser.switch_to.default_content()
+    print("Editor fechado. Processo SEI permanece aberto.")
+
+    print("Atualizando status na planilha de BMs...")
+    executar_discreto(atualizar_status_apos_gop, linhas[0], gop["numero_sei"])
+    print("Processamento finalizado com sucesso.")
+    return "CONCLUIDO"
+
+
+def monitorar_planilha():
+    browser = None
+    bloqueados = set()  # não tenta de novo, nessa execução, os casos incertos
+
     print("=" * 72)
     print("SEIs EM MONITORAMENTO")
-    print(f"Processo: {SEI_ALVO}")
-    print("=" * 72)
-
-    browser = None
-    houve_criacao = False
     try:
-        registros = executar_discreto(obter_aguardando_sei)
-        linhas = [d for d in registros if str(d["numero_sei"]).strip() == SEI_ALVO]
-        if len(linhas) != 1:
-            raise RuntimeError(
-                f"Verificar Status do SEI"
-            )
-
-        browser = executar_discreto(iniciar_robo)
-        print(f"Verificando: {SEI_ALVO}")
-
-        browser.switch_to.default_content()
-        acao = parse_qs(urlparse(browser.current_url).query).get("acao", [""])[0]
-
-        if acao == "procedimento_controlar":
-            if not executar_discreto(verificar_recebidos, browser, SEI_ALVO):
-                raise RuntimeError("Processo não encontrado no Controle de Processos.")
-        elif acao != "procedimento_trabalhar":
-            raise RuntimeError("Abra o SEI autenticado em Controle de Processos ou no processo-alvo.")
-
-        validar_processo_atual(browser)
-        solicitacoes = executar_discreto(listar_solicitacoes, browser)
-        lotes = executar_discreto(preparar_lotes, linhas, solicitacoes, browser)
-        if len(lotes) != 1:
-            raise RuntimeError("Solicitação não identificada de maneira única; revisão manual necessária.")
-
-        solicitacao = lotes[0]["solicitacao"]
-        print(f"Encontrou solicitação de disponibilidade: {solicitacao['texto']}")
-        print(f"Número: {solicitacao['numero']}")
-
-        link = executar_discreto(capturar_link_solicitacao, browser, solicitacao)
-        if not link:
-            raise RuntimeError("Link de acesso direto não foi confirmado.")
-        print("Link Copiado")  # o acesso direto foi capturado do SEI
-        # Encerrar o menu contextual aberto pela captura do link antes de criar o GOP.
-        executar_discreto(fechar_menu_solicitacao, browser, solicitacao)
-
-        if TESTE_SOMENTE_LEITURA:
-            print("Teste finalizado: nenhuma criação ou alteração de GOP.")
-            return
-
-        # Fluxo completo: preserva as funções de criação e edição existentes.
-        if not executar_discreto(conferir_responsavel, linhas):
-            raise RuntimeError("Responsável não confirmado.")
-        print("Gerando documento CEHAB - DISPONIBILIDADE FINANCEIRA - GOP...")
-        # Evita capturar um editor antigo ainda aberto no Chrome.
-        executar_discreto(verificar_sem_editor_pendente, browser)
-        
-        principal = executar_discreto(
-            janela_principal_sei, browser
-        )
-
-        # Registra todos os GOPs existentes ANTES da criação.
-        gops_antes = executar_discreto(
-            localizar_gops_na_arvore, browser
-        )
-
-        executar_discreto(
-            mostrar_criacao,
-            browser,
-            SEI_ALVO,
-            solicitacao["numero"]
-        )
-
-        houve_criacao = True
-
-        numero = executar_discreto(
-            criar_documento,
-            browser,
-            linhas[0],
-            solicitacao
-        )
-
-        if numero != solicitacao["numero"]:
-            raise RuntimeError(
-                "Criação não confirmada. "
-                "Confira no SEI antes de repetir."
-            )
-
-        print("Documento solicitado.")
-
-        # Identifica o GOP novo sem depender do editor automático.
-        gop = executar_discreto(
-            obter_gop_pos_criacao,
-            browser,
-            principal,
-            gops_antes,
-            limite=30
-        )
-
-        executar_discreto(selecionar_gop_recem_criado, browser, gop["id_interno"], gop["numero_sei"])
-        executar_discreto(clicar_editar_conteudo, browser, gop["id_interno"])
-        print("Editor de conteúdo aberto")
-        mensagem = executar_discreto(
-            montar_mensagem_gop,
-            linhas[0],
-            solicitacao["numero"],
-            gop["numero_sei"]
-        )
-        print("Inserindo mensagem financeira da planilha...")
-        executar_discreto(
-            apagar_conteudo_e_salvar,
-            browser,
-            gop,
-            mensagem,
-            solicitacao["numero"],
-            link
-        )
-
-        print(f"GOP salvo: {gop['numero_sei']}")
-
-        # Fecha somente a janela correta do editor.
-        parametros = parse_qs(urlparse(browser.current_url).query)
-
-        if (
-            parametros.get("acao", [""])[0] != "editor_montar"
-            or parametros.get("id_documento", [""])[0]
-            != str(gop["id_interno"])
-        ):
-            raise RuntimeError(
-                "Janela do editor não corresponde ao GOP esperado."
-            )
-
-        browser.close()
-        browser.switch_to.window(principal)
-        browser.switch_to.default_content()
-
-        print("Editor fechado. Processo SEI permanece aberto.")
-
-        # =====================================================
-        # ATUALIZAR STATUS NA PLANILHA
-        # Executar somente após salvar e fechar o GOP.
-        # =====================================================
-
-        print("Atualizando status na planilha de BMs...")
-
-        executar_discreto(
-            atualizar_status_apos_gop,
-            linhas[0],
-            gop["numero_sei"]
-        )
-
-        print("Processamento finalizado com sucesso.")
-
-    except Exception as erro:
-        print(f"Erro: {erro}")
-        with open(LOG_DETALHADO, "a", encoding="utf-8") as arquivo:
-            arquivo.write("\n--- ERRO ---\n")
-            traceback.print_exc(file=arquivo)
-        if houve_criacao:
-            print("Atenção: o GOP pode ter sido criado. Confira antes de repetir.")
-        print(f"Diagnóstico detalhado: {LOG_DETALHADO}")
-    finally:
-        if browser is not None:
+        while True:
             try:
-                browser.switch_to.default_content()
-            except Exception:
-                pass
+                registros = executar_discreto(obter_aguardando_sei)
+            except Exception as erro:
+                print(f"Erro ao ler planilha: {erro}")
+                if APENAS_LISTAR_FILA:
+                    break
+                time.sleep(INTERVALO_CONSULTA)
+                continue
+
+            fila = {}
+            for dados in registros:
+                processo = str(dados["numero_sei"]).strip()
+                if not re.fullmatch(r"\d{10,14}\.\d{6}/\d{4}-\d{2}", processo):
+                    print(f"Linha {dados['linha_planilha']}: SEI inválido ou vazio. Ignorando.")
+                    continue
+                fila.setdefault(processo, []).append(dados)
+
+            print("=" * 72)
+            print(f"SEIs EM MONITORAMENTO — {len(fila)} processos")
+            for processo in fila:
+                print(f"Processo: {processo}")
+            print("=" * 72)
+
+            if APENAS_LISTAR_FILA:
+                print("Somente listagem: nenhum documento foi criado.")
+                break
+
+            tentativas_no_ciclo = 0
+            for processo, linhas in fila.items():
+                if processo in bloqueados:
+                    continue
+                tentativas_no_ciclo += 1
+                try:
+                    if browser is None:
+                        browser = executar_discreto(iniciar_robo)
+                    resultado = processar_sei_da_fila(browser, processo, linhas)
+                    if resultado != "CONCLUIDO":
+                        bloqueados.add(processo)
+                except Exception as erro:
+                    bloqueados.add(processo)
+                    print(f"Erro no processo {processo}: {erro}")
+                    print("REVISÃO: pode ter criado GOP. Não haverá nova tentativa automática.")
+                    with open(LOG_DETALHADO, "a", encoding="utf-8") as arquivo:
+                        arquivo.write(f"\n--- ERRO NO PROCESSO {processo} ---\n")
+                        traceback.print_exc(file=arquivo)
+                    print(f"Diagnóstico detalhado: {LOG_DETALHADO}")
+                    if PARAR_EM_ERRO:
+                        print("Fila interrompida para revisão.")
+                        return
+
+                    print(
+                        f"Processo {processo} ignorado nesta execução."
+                    )
+                    print("Passando para o próximo SEI da fila...")
+                if LIMITE_POR_CICLO and tentativas_no_ciclo >= LIMITE_POR_CICLO:
+                    break
+
+            print(f"Ciclo finalizado. Nova consulta em {INTERVALO_CONSULTA}s.")
+            time.sleep(INTERVALO_CONSULTA)
+    except KeyboardInterrupt:
+        print("Monitoramento interrompido pelo usuário.")
+    finally:
         print("Chrome NUPCO mantido aberto.")
 
 
 if __name__ == "__main__":
-    executar_teste()
+    monitorar_planilha()
