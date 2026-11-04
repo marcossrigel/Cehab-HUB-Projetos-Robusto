@@ -31,7 +31,7 @@ MODO_VISUAL_DESPACHO = True
 PAUSA_ENTRE_ACOES = 1.5
 
 # Somente este processo poderá ser processado no teste.
-SEI_ALVO = "00609110022711.000940/2026-30"
+SEI_ALVO = "0060900175.001099/2026-81"
 
 def conectar_planilha():
     load_dotenv(ENV_PATH)
@@ -2933,8 +2933,9 @@ def apagar_conteudo_e_salvar(browser, gop, mensagem, numero_solicitacao, link):
     padrao = (
         r"liquidação do BM\s+(?P<bm>[^,\n]+),"
         r"\s+no valor de\s+(?P<valor>R\$\s*[\d.,]+),"
-        r"\s+na Fonte de Recursos\s+(?P<fonte>.*?)"
-        r"\s+\(Tipo da Fonte"
+        r"\s+na Fonte de Recursos\s+"
+        r"(?P<fonte>\d{10}(?:\s*/\s*\d{10})*)"
+        r"\s+\("
     )
 
     correspondencia = re.search(padrao, mensagem)
@@ -2950,6 +2951,27 @@ def apagar_conteudo_e_salvar(browser, gop, mensagem, numero_solicitacao, link):
         correspondencia.span("valor"),
         correspondencia.span("fonte"),
     ]
+
+    # Destaca as observações FINISA, quando presentes.
+    observacoes = [
+        (
+            "OBS: Precisa constar na Nota Fiscal o número "
+            "do Contrato de Financiamento FINISA "
+            "Nº 0655.144-00"
+        )
+    ]
+
+    for observacao in observacoes:
+        inicio = mensagem.find(observacao)
+
+        if inicio >= 0:
+            trechos.append((
+                inicio,
+                inicio + len(observacao)
+            ))
+
+    # Garante que a digitação siga a ordem do documento.
+    trechos.sort(key=lambda trecho: trecho[0])
 
     posicao = 0
 
@@ -3125,6 +3147,15 @@ def montar_mensagem_gop(dados, numero_solicitacao, numero_gop):
     numero_gop = str(numero_gop).strip()
     bm = str(colunas[13]).strip()
 
+    # Valor da coluna RESOLUÇÃO da planilha.
+    resolucao = str(dados.get("resolucao") or "").strip()
+
+    if not resolucao:
+        raise ValueError(
+            "Coluna RESOLUÇÃO vazia para este SEI. "
+            "Não será gerado um documento incompleto."
+        )
+
     if not re.fullmatch(r"\d{8}", numero_gop):
         raise RuntimeError(
             "Número do GOP criado não identificado corretamente."
@@ -3157,9 +3188,71 @@ def montar_mensagem_gop(dados, numero_solicitacao, numero_gop):
         .replace("#", ".")
     )
 
-    fonte = str(
-        dados.get("fonte_recurso", "")
+        # Verifica a coluna FONTE (AE) da planilha.
+    
+    # Verificar a coluna AE (FONTE) da planilha.
+    # Índice 30 corresponde à coluna AE.
+
+    fonte_ae = (
+        str(colunas[30]).strip()
+        if len(colunas) > 30
+        else ""
+    )
+
+    fonte_registro = str(
+        dados.get("fonte", "")
     ).strip()
+
+    # Considera tanto o valor exibido na planilha
+    # quanto o valor convertido por get_all_records().
+    fontes_planilha = f"{fonte_ae}\n{fonte_registro}"
+
+    codigos_fonte = {
+        codigo.zfill(10)
+        for codigo in re.findall(
+            r"(?<!\d)\d{9,10}(?!\d)",
+            fontes_planilha
+        )
+    }
+
+    if not codigos_fonte:
+        raise RuntimeError(
+            "Nenhum código de FONTE identificado na "
+            "coluna AE. Documento não será gerado."
+        )
+
+    tem_finisa = "0754006019" in codigos_fonte
+
+    # Fonte de Recursos: códigos da coluna AE.
+    fonte = " / ".join(sorted(codigos_fonte))
+
+    # Conteúdo dos parênteses: Ficha Financeira (AH).
+    ficha_financeira = str(
+        dados.get("ficha_financeira") or ""
+    ).strip()
+
+    if not ficha_financeira:
+        raise ValueError(
+            "Ficha Financeira (AH) vazia. "
+            "Não será gerado documento incompleto."
+        )
+
+    print("[FONTE] Valor da coluna AE:", repr(fonte_ae))
+    print("[FONTE] Códigos identificados:", sorted(codigos_fonte))
+    print(
+        "[FINISA] Regra aplicada:",
+        "SIM" if tem_finisa else "NÃO"
+    )
+
+
+    observacao_finisa = ""
+
+    if tem_finisa:
+        observacao_finisa = (
+            "OBS: Precisa constar na Nota Fiscal o número "
+            "do Contrato de Financiamento FINISA "
+            "Nº 0655.144-00\n\n"
+        )
 
     if not processo or not solicitacao or not bm or not fonte:
         raise ValueError(
@@ -3182,8 +3275,11 @@ def montar_mensagem_gop(dados, numero_solicitacao, numero_gop):
         "e financeira para liquidação do "
         f"BM {bm}, no valor de R$ {valor}, "
         f"na Fonte de Recursos {fonte} "
-        "(Tipo da Fonte Ex.: Tesouro do Estado).\n\n"
+        f"({ficha_financeira}).\n\n"
+        f"{observacao_finisa}"
+        f"{'-' * 150}\n\n"
         "À GEFIN,\n\n"
+        f"{resolucao}\n\n"
     )
         
     print("[MENSAGEM] Processo:", processo)
@@ -3593,7 +3689,7 @@ def executar_teste():
         linhas = [d for d in registros if str(d["numero_sei"]).strip() == SEI_ALVO]
         if len(linhas) != 1:
             raise RuntimeError(
-                f"Esperada uma única linha na planilha para este processo; encontradas {len(linhas)}."
+                f"Verificar Status do SEI"
             )
 
         browser = executar_discreto(iniciar_robo)
