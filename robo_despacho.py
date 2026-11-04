@@ -2938,122 +2938,175 @@ def montar_mensagem_gop(dados, numero_solicitacao):
     return mensagem
 
 
-
 def capturar_link_solicitacao(browser, solicitacao):
     """
-    Captura o acesso direto do documento encontrado
-    na árvore, sem número fixo ou XPath numérico fixo.
-    """
-    import tkinter as tk
+    Captura o número e o Link para Acesso Direto
+    diretamente dos atributos do menu da solicitação.
 
-    numero = solicitacao["numero"]
-    id_interno = solicitacao["id_interno"]
+    Não clica no menu nem utiliza o clipboard.
+    """
+
+    numero = str(solicitacao["numero"]).strip()
+    id_interno = str(solicitacao["id_interno"]).strip()
+
+    if not re.fullmatch(r"\d{8}", numero):
+        raise RuntimeError("Número da solicitação inválido.")
+
+    if not id_interno.isdigit():
+        raise RuntimeError("ID interno inválido.")
 
     browser.switch_to.default_content()
-    browser.switch_to.frame(
-        browser.find_element(By.ID, "ifrArvore")
-    )
 
     try:
-        # Identifica a âncora exata do documento.
-        ancora = WebDriverWait(browser, 15).until(
-            EC.presence_of_element_located((
-                By.ID, f"anchor{id_interno}"
-            ))
+        WebDriverWait(browser, 20).until(
+            EC.frame_to_be_available_and_switch_to_it(
+                (By.ID, "ifrArvore")
+            )
         )
 
-        texto = ancora.text.strip()
+        # Confirma qual documento estamos consultando.
+        ancora = WebDriverWait(browser, 15).until(
+            EC.presence_of_element_located(
+                (By.ID, f"anchor{id_interno}")
+            )
+        )
 
-        if numero not in texto:
+        texto = normalizar_texto(ancora.text)
+
+        if (
+            "SOLICITACAO DE DISPONIBILIDADE FINANCEIRA"
+            not in texto
+            or numero not in re.findall(
+                r"(?<!\d)\d{8}(?!\d)", texto
+            )
+        ):
             raise RuntimeError(
                 "A âncora não corresponde à solicitação."
             )
 
-        # O menu é associado ao ID interno.
-        icone = WebDriverWait(browser, 15).until(
-            EC.element_to_be_clickable((
-                By.ID, f"anchorImg{id_interno}"
+        # Menu associado exclusivamente a essa solicitação.
+        menu = WebDriverWait(browser, 15).until(
+            EC.presence_of_element_located((
+                By.ID,
+                f"popover-contentanchorImg{id_interno}"
             ))
         )
 
-        icone.click()
-
-        # Procura a opção pelo texto visível.
-        opcao = WebDriverWait(browser, 15).until(
-            EC.element_to_be_clickable((
-                By.XPATH,
-                f'//*[@id="popover-contentanchorImg{id_interno}"]'
-                '//a[contains(normalize-space(.),'
-                '"Link para Acesso Direto")]'
-            ))
+        # 1. Identificar o número do documento.
+        numeros = menu.find_elements(
+            By.CSS_SELECTOR,
+            'a[tipo="texto"][data-clipboard-text]'
         )
 
-        # Se o menu tiver uma URL HTTPS direta,
-        # podemos utilizá-la sem clicar.
-        href = (opcao.get_attribute("href") or "").strip()
+        numeros_corretos = [
+            opcao for opcao in numeros
+            if (
+                opcao.get_attribute("data-clipboard-text")
+                or ""
+            ).strip() == numero
+        ]
 
-        if href.startswith("https://"):
-            link = href
+        if len(numeros_corretos) != 1:
+            raise RuntimeError(
+                "Número da solicitação não encontrado "
+                "de maneira única no menu."
+            )
 
-        else:
-            # O SEI pode copiar o link para o clipboard.
-            raiz = tk.Tk()
-            raiz.withdraw()
+        print("Número do documento capturado:", numero)
 
-            try:
-                try:
-                    anterior = raiz.clipboard_get().strip()
-                except tk.TclError:
-                    anterior = None
+        # 2. Identificar Link para Acesso Direto.
+        opcoes_link = menu.find_elements(
+            By.CSS_SELECTOR,
+            'a[tipo="url"][data-clipboard-text]'
+        )
 
-                opcao.click()
+        if len(opcoes_link) != 1:
+            raise RuntimeError(
+                "Link para Acesso Direto não encontrado "
+                "de maneira única."
+            )
 
-                link = None
+        opcao_link = opcoes_link[0]
 
-                for tentativa in range(10):
-                    time.sleep(0.3)
-                    raiz.update()
+        # O menu pode estar oculto no DOM do iframe.
+        # Por isso, não utilizamos .text para validar a opção.
 
-                    try:
-                        atual = raiz.clipboard_get().strip()
-                    except tk.TclError:
-                        continue
+        tipo_opcao = (
+            opcao_link.get_attribute("tipo") or ""
+        ).strip().lower()
 
-                    if atual and atual != anterior:
-                        link = atual
-                        break
+        if tipo_opcao != "url":
+            raise RuntimeError(
+                "A opção encontrada não é do tipo URL."
+            )
 
-                if not link:
-                    raise RuntimeError(
-                        "O SEI não forneceu um novo link "
-                        "na área de transferência."
-                    )
+        link = (
+            opcao_link.get_attribute("data-clipboard-text")
+            or ""
+        ).strip()
 
-            finally:
-                raiz.destroy()
-
-        # Validar o domínio para não aceitar URL externa.
+        # 3. Validar o endereço antes de usar no GOP.
         url = urlparse(link)
+        parametros = parse_qs(url.query)
 
         if (
             url.scheme != "https"
             or url.hostname != "sei.pe.gov.br"
+            or url.path != "/sei/controlador.php"
         ):
             raise RuntimeError(
-                "O link capturado não é uma URL válida do SEI."
+                "O acesso direto não pertence ao SEI."
             )
 
-        print("[LINK] Solicitação:", numero)
-        print("[LINK] Acesso direto capturado com sucesso.")
-        print("[LINK] URL não exibida por conter dados de acesso.")
+        if parametros.get("acao", [""])[0] != (
+            "procedimento_trabalhar"
+        ):
+            raise RuntimeError(
+                "Ação inesperada no acesso direto."
+            )
 
+        id_documento_link = parametros.get(
+            "id_documento", [""]
+        )[0]
+
+        if id_documento_link != id_interno:
+            raise RuntimeError(
+                "O link aponta para outro documento."
+            )
+
+        # Confirma que o processo também corresponde.
+        url_arvore = urlparse(
+            ancora.get_attribute("href") or ""
+        )
+
+        parametros_arvore = parse_qs(url_arvore.query)
+
+        id_processo_arvore = parametros_arvore.get(
+            "id_procedimento", [""]
+        )[0]
+
+        id_processo_link = parametros.get(
+            "id_procedimento", [""]
+        )[0]
+
+        if (
+            not id_processo_arvore
+            or id_processo_arvore != id_processo_link
+        ):
+            raise RuntimeError(
+                "O link aponta para outro processo."
+            )
+
+        # 4. Entregar as variáveis ao restante do robô.
         solicitacao["link_direto"] = link
+
+        print("Link para Acesso Direto capturado.")
+        print("Referência do documento confirmada.")
 
         return link
 
     finally:
         browser.switch_to.default_content()
-
 
 
 def fechar_menu_solicitacao(browser, solicitacao):
