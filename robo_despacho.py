@@ -2660,30 +2660,180 @@ def apagar_conteudo_e_salvar(browser, gop, mensagem, numero_solicitacao, link):
     print(f"[EDITOR] Localizado: {editor.get_attribute('id')}")
 
     # 1. Apaga todo o conteúdo anterior.
-    editor.click()
-    editor.send_keys(Keys.CONTROL, "a")
-    editor.send_keys(Keys.BACKSPACE)
+    
+    # 1. Preservar Atenciosamente e toda a assinatura.
+    
+    resultado_assinatura = browser.execute_script(r"""
+        const editor = arguments[0];
 
-    time.sleep(1)
+        // Procura Atenciosamente em qualquer nó de texto,
+        // mesmo que esteja dentro de table, td, span ou p.
+        const walker = document.createTreeWalker(
+            editor,
+            NodeFilter.SHOW_TEXT
+        );
+
+        const encontrados = [];
+        let no;
+
+        while ((no = walker.nextNode())) {
+            const texto = (no.textContent || "").trim();
+
+            if (/^Atenciosamente\s*,?/i.test(texto)) {
+                encontrados.push(no);
+            }
+        }
+
+        if (encontrados.length !== 1) {
+            return {
+                ok: false,
+                erro: "Marcador Atenciosamente não identificado",
+                quantidade: encontrados.length
+            };
+        }
+
+        // Sobe pela estrutura HTML até encontrar
+        // o bloco que é filho direto do editor.
+        let bloco = encontrados[0].parentElement;
+
+        while (
+            bloco &&
+            bloco.parentElement !== editor
+        ) {
+            bloco = bloco.parentElement;
+        }
+
+        if (!bloco || bloco.parentElement !== editor) {
+            return {
+                ok: false,
+                erro: "Bloco da assinatura fora do editor"
+            };
+        }
+
+        // Não permite apagar parte de um bloco
+        // que também contenha outros textos.
+        const textoBloco = (
+            bloco.innerText || bloco.textContent || ""
+        ).trim();
+
+        if (!/^Atenciosamente\s*,?/i.test(textoBloco)) {
+            return {
+                ok: false,
+                erro: "Bloco começa antes de Atenciosamente",
+                inicio: textoBloco.slice(0, 100)
+            };
+        }
+
+        const conteudo = editor.innerText || "";
+        const marcador = /Atenciosamente\s*,?/i.exec(conteudo);
+
+        if (!marcador) {
+            return {
+                ok: false,
+                erro: "Assinatura não encontrada no texto"
+            };
+        }
+
+        const anterior = conteudo.slice(0, marcador.index);
+        const assinatura = conteudo.slice(marcador.index).trim();
+
+        if (
+            !anterior.includes("X.XXX,XX") ||
+            !anterior.includes("XXXXXXXXXX")
+        ) {
+            return {
+                ok: false,
+                erro: "Documento não contém o modelo original"
+            };
+        }
+
+        if (assinatura.length < 25) {
+            return {
+                ok: false,
+                erro: "Assinatura original incompleta"
+            };
+        }
+
+        // Seleciona do início do editor até
+        // imediatamente ANTES do bloco Atenciosamente.
+        editor.focus();
+
+        const range = document.createRange();
+        range.setStart(editor, 0);
+        range.setEndBefore(bloco);
+
+        const selecao = window.getSelection();
+        selecao.removeAllRanges();
+        selecao.addRange(range);
+
+        if (selecao.isCollapsed) {
+            return {
+                ok: false,
+                erro: "Seleção vazia"
+            };
+        }
+
+        return {
+            ok: true,
+            assinatura: assinatura,
+            bloco: bloco.tagName,
+            selecionado: selecao.toString().slice(0, 100)
+        };
+    """, editor)
+
+
+    if not resultado_assinatura.get("ok"):
+        raise RuntimeError(
+            "Não foi possível preservar a assinatura: "
+            f"{resultado_assinatura}"
+        )
+
+    assinatura_original = resultado_assinatura["assinatura"]
+
+    # Apaga somente a seleção anterior à assinatura.
+    from selenium.webdriver.common.action_chains import ActionChains
+
+    ActionChains(browser).send_keys(
+        Keys.BACKSPACE
+    ).perform()
 
     editor = browser.find_element(By.CSS_SELECTOR, seletor)
 
-    restante = (
-        editor.get_attribute("innerText") or ""
-    ).strip()
+    def normalizar_assinatura(texto):
+        return re.sub(r"\s+", " ", texto).strip()
 
-    if restante:
+    restante = editor.get_attribute("innerText") or ""
+
+    if (
+        normalizar_assinatura(restante) !=
+        normalizar_assinatura(assinatura_original)
+    ):
         raise RuntimeError(
-            f"Não foi possível limpar o editor: {restante[:150]}"
+            "A assinatura original foi modificada "
+            "durante a limpeza. Salvamento bloqueado."
         )
 
     print("[EDITOR] Conteúdo anterior apagado.")
+    print("[EDITOR] Assinatura original preservada.")
+
 
     # 2. Escreve a mensagem pronta pelo teclado.
-    print("[EDITOR] Inserindo mensagem completa...")
+        # 2. Escrever antes de Atenciosamente.
+    print("[EDITOR] Inserindo mensagem financeira...")
 
-    
-    editor.click()
+    browser.execute_script("""
+        const editor = arguments[0];
+
+        const range = document.createRange();
+        range.setStart(editor, 0);
+        range.collapse(true);
+
+        editor.focus();
+
+        const selecao = window.getSelection();
+        selecao.removeAllRanges();
+        selecao.addRange(range);
+    """, editor)
 
     # Identifica os três valores dentro da mensagem montada.
     padrao = (
@@ -2712,18 +2862,33 @@ def apagar_conteudo_e_salvar(browser, gop, mensagem, numero_solicitacao, link):
     for inicio, fim in trechos:
         # Insere texto normal até o próximo valor.
         if inicio > posicao:
-            editor.send_keys(mensagem[posicao:inicio])
+            ActionChains(browser).send_keys(
+                mensagem[posicao:inicio]
+            ).perform()
 
         # Liga negrito, escreve o valor e desliga negrito.
-        editor.send_keys(Keys.CONTROL, "b")
-        editor.send_keys(mensagem[inicio:fim])
-        editor.send_keys(Keys.CONTROL, "b")
+        ActionChains(browser).key_down(
+            Keys.CONTROL
+        ).send_keys("b").key_up(
+            Keys.CONTROL
+        ).perform()
+        ActionChains(browser).send_keys(
+            mensagem[inicio:fim]
+        ).perform()
+
+        ActionChains(browser).key_down(
+            Keys.CONTROL
+        ).send_keys("b").key_up(
+            Keys.CONTROL
+        ).perform()
 
         posicao = fim
 
     # Insere o restante da mensagem normalmente.
     if posicao < len(mensagem):
-        editor.send_keys(mensagem[posicao:])
+        ActionChains(browser).send_keys(
+            mensagem[posicao:]
+        ).perform()
 
     print("[EDITOR] BM, valor e fonte inseridos em negrito.")
 
@@ -2740,7 +2905,9 @@ def apagar_conteudo_e_salvar(browser, gop, mensagem, numero_solicitacao, link):
     def normalizar(texto):
         return re.sub(r"\s+", " ", texto).strip()
 
-    esperado = normalizar(mensagem)
+    esperado = normalizar(
+        mensagem + "\n\n" + assinatura_original
+    )
     recebido = normalizar(texto_atual)
 
     if esperado != recebido:
@@ -2904,13 +3071,6 @@ def montar_mensagem_gop(dados, numero_solicitacao):
             "Processo ou solicitação diferentes do teste."
         )
 
-    # Assinatura textual específica do teste atual.
-    assinatura = (
-        "Laudenor Morais Correia de Melo Assunção\n"
-        "Assessor\n"
-        "GERÊNCIA DE ORÇAMENTO E PLANEJAMENTO PAGAMENTOS"
-    )
-
     mensagem = (
         "DISPONIBILIDADE FINANCEIRA - GOP\n\n"
         "CEHAB - DISPONIBILIDADE FINANCEIRA - GOP\n\n"
@@ -2923,10 +3083,8 @@ def montar_mensagem_gop(dados, numero_solicitacao):
         f"BM {bm}, no valor de R$ {valor}, "
         f"na Fonte de Recursos {fonte} "
         "(Tipo da Fonte Ex.: Tesouro do Estado).\n\n"
-        "Atenciosamente,\n\n"
-        f"{assinatura}"
     )
-
+        
     print("[MENSAGEM] Processo:", processo)
     print("[MENSAGEM] Solicitação:", solicitacao)
     print("[MENSAGEM] BM:", bm)
