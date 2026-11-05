@@ -33,7 +33,7 @@ PAUSA_ENTRE_ACOES = 1.5
 # Somente este processo poderá ser processado no teste.
 # Fila alimentada pela planilha; não há processo fixo.
 APENAS_LISTAR_FILA = False
-INTERVALO_CONSULTA = 90
+INTERVALO_CONSULTA = 20
 LIMITE_POR_CICLO = 0
 BLOQUEAR_GOP_EXISTENTE = True
 PARAR_EM_ERRO = False      # Interrompe o lote para revisão se houver falha.
@@ -163,98 +163,6 @@ def atualizar_status_apos_gop(linhas, numero_gop):
     return True
 
 
-
-
-def atualizar_status_apos_gop(dados, numero_gop):
-    """
-    Atualiza somente a célula STATUS da linha processada.
-
-    Executar exclusivamente depois de confirmar
-    o salvamento do GOP e fechar o editor.
-    """
-
-    worksheet = conectar_planilha()
-
-    linha = int(dados["linha_planilha"])
-    sei_esperado = str(dados["numero_sei"]).strip()
-
-    # Identificar as colunas pelos cabeçalhos.
-    cabecalhos = [
-        str(valor).strip()
-        for valor in worksheet.row_values(1)
-    ]
-
-    if cabecalhos.count("STATUS") != 1:
-        raise RuntimeError(
-            "Coluna STATUS não identificada de forma única."
-        )
-
-    if cabecalhos.count("N° do SEI") != 1:
-        raise RuntimeError(
-            "Coluna N° do SEI não identificada de forma única."
-        )
-
-    coluna_status = cabecalhos.index("STATUS") + 1
-    coluna_sei = cabecalhos.index("N° do SEI") + 1
-
-    # Confirma que STATUS continua sendo a coluna Z.
-    if coluna_status != 26:
-        raise RuntimeError(
-            "A coluna STATUS mudou de posição. "
-            "Atualização interrompida."
-        )
-
-    # Relê a linha diretamente do Google Sheets.
-    valores = worksheet.row_values(linha)
-
-    def valor_coluna(indice):
-        if len(valores) >= indice:
-            return str(valores[indice - 1]).strip()
-        return ""
-
-    sei_atual = valor_coluna(coluna_sei)
-    status_atual = valor_coluna(coluna_status).upper()
-
-    if sei_atual != sei_esperado:
-        raise RuntimeError(
-            f"Linha {linha} não corresponde ao SEI esperado. "
-            "Nenhuma alteração foi realizada."
-        )
-
-    # Nunca sobrescrever outro status.
-    if status_atual != "AGUARDANDO SEI":
-        raise RuntimeError(
-            f"Status inesperado na linha {linha}: "
-            f"{status_atual!r}. Nenhuma alteração realizada."
-        )
-
-    # Altera exclusivamente a célula STATUS.
-    celula = f"Z{linha}"
-
-    worksheet.update_acell(
-        celula,
-        "AGUARDANDO ASSINATURA"
-    )
-
-    # Confirma a gravação.
-    status_confirmado = (
-        worksheet.acell(celula).value or ""
-    ).strip().upper()
-
-    if status_confirmado != "AGUARDANDO ASSINATURA":
-        raise RuntimeError(
-            "O Google Sheets não confirmou "
-            "a atualização do status."
-        )
-
-    print(
-        f"Planilha atualizada: linha {linha} | "
-        "AGUARDANDO ASSINATURA"
-    )
-
-    print(f"GOP vinculado ao processo: {numero_gop}")
-
-    return True
 
 
 def obter_aguardando_sei():
@@ -1143,7 +1051,7 @@ def conferir_responsavel(linhas):
 
     responsaveis = {
 
-        normalizar_texto(dados.get("responsavel", ""))
+        normalizar_texto(dados.get("responsavel") or "")
 
         for dados in linhas
 
@@ -1473,7 +1381,7 @@ def criar_documento(browser, dados, solicitacao):
 
 
 
-            dados.get("responsavel", "")
+            dados.get("responsavel") or ""
 
 
 
@@ -3861,11 +3769,10 @@ def consolidar_linhas_mesmo_sei(linhas):
             "Linhas pertencem a processos SEI diferentes."
         )
 
-    # O modelo atual admite um BM, uma fonte,
-    # uma ficha financeira e um responsável.
-    for campo in ("fonte", "ficha_financeira", "responsavel"):
+    # Fonte e ficha financeira permanecem obrigatorias e uniformes.
+    for campo in ("fonte", "ficha_financeira"):
         valores = {
-            normalizar_texto(d.get(campo, ""))
+            normalizar_texto(d.get(campo) or "")
             for d in ordenadas
         }
 
@@ -3874,6 +3781,18 @@ def consolidar_linhas_mesmo_sei(linhas):
                 f"Linhas com {campo} diferentes ou vazios. "
                 "Revisão necessária."
             )
+
+    # Responsavel e opcional: todos vazios e permitido.
+    # Misturar nomes, ou nome com vazio, continua proibido.
+    responsaveis = {
+        normalizar_texto(d.get("responsavel") or "")
+        for d in ordenadas
+    }
+    if len(responsaveis) != 1:
+        raise RuntimeError(
+            "Linhas com responsaveis diferentes ou parcialmente vazios. "
+            "Revisão necessária."
+        )
 
     bms = set()
     total = Decimal("0.00")
@@ -3967,7 +3886,7 @@ def consolidar_linhas_mesmo_sei(linhas):
 
 
 
-def processar_sei_da_fila(browser, numero_sei, linhas):
+def processar_sei_da_fila(browser, numero_sei, linhas, controle):
     """Reaproveita as etapas já validadas; não desconecta o Chrome."""
     if not linhas:
         raise RuntimeError("Processo sem linhas pendentes.")
@@ -4032,7 +3951,9 @@ def processar_sei_da_fila(browser, numero_sei, linhas):
     print("Gerando documento CEHAB - DISPONIBILIDADE FINANCEIRA - GOP...")
     executar_discreto(mostrar_criacao, browser, numero_sei, solicitacao["numero"])
 
-    # A partir deste ponto não repetir automaticamente em caso de erro.
+    # A partir deste ponto uma criação pode ocorrer no SEI.
+    # Se houver erro daqui em diante, não tentar novamente sem revisão.
+    controle["criacao_iniciada"] = True
     numero = executar_discreto(
         criar_documento, browser, dados_consolidados, solicitacao
     )
@@ -4111,7 +4032,6 @@ def monitorar_planilha():
             print(f"SEIs EM MONITORAMENTO — {len(fila)} processos")
             for processo in fila:
                 print(f"Processo: {processo}")
-            print("=" * 72)
 
             if APENAS_LISTAR_FILA:
                 print("Somente listagem: nenhum documento foi criado.")
@@ -4120,18 +4040,34 @@ def monitorar_planilha():
             tentativas_no_ciclo = 0
             for processo, linhas in fila.items():
                 if processo in bloqueados:
+                    print(f"{processo}: bloqueado para revisão (criação incerta ou GOP existente).")
                     continue
                 tentativas_no_ciclo += 1
+                controle = {"criacao_iniciada": False}
                 try:
                     if browser is None:
                         browser = executar_discreto(iniciar_robo)
-                    resultado = processar_sei_da_fila(browser, processo, linhas)
-                    if resultado != "CONCLUIDO":
+                    resultado = processar_sei_da_fila(
+                        browser, processo, linhas, controle
+                    )
+                    if resultado == "REVISAR":
+                        # Já existe GOP; não criar outro neste processo.
                         bloqueados.add(processo)
+                        print(f"{processo}: GOP existente. Bloqueado para revisão.")
+                    elif resultado == "LEITURA":
+                        print(f"{processo}: somente leitura. Nova verificação no próximo ciclo.")
+                    elif resultado != "CONCLUIDO":
+                        # Um resultado não previsto não autoriza nova criação.
+                        bloqueados.add(processo)
+                        print(f"{processo}: resultado inesperado {resultado!r}; revisão necessária.")
                 except Exception as erro:
-                    bloqueados.add(processo)
                     print(f"Erro no processo {processo}: {erro}")
-                    print("REVISÃO: pode ter criado GOP. Não haverá nova tentativa automática.")
+                    if controle["criacao_iniciada"]:
+                        bloqueados.add(processo)
+                        print("REVISÃO: criação pode ter começado. Não haverá nova tentativa automática.")
+                    else:
+                        print("Nenhum GOP foi solicitado nesta tentativa.")
+                        print(f"O processo será pesquisado novamente no SEI no próximo ciclo ({INTERVALO_CONSULTA}s).")
                     with open(LOG_DETALHADO, "a", encoding="utf-8") as arquivo:
                         arquivo.write(f"\n--- ERRO NO PROCESSO {processo} ---\n")
                         traceback.print_exc(file=arquivo)
@@ -4139,10 +4075,6 @@ def monitorar_planilha():
                     if PARAR_EM_ERRO:
                         print("Fila interrompida para revisão.")
                         return
-
-                    print(
-                        f"Processo {processo} ignorado nesta execução."
-                    )
                     print("Passando para o próximo SEI da fila...")
                 if LIMITE_POR_CICLO and tentativas_no_ciclo >= LIMITE_POR_CICLO:
                     break
